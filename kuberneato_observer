@@ -11,10 +11,12 @@ function show_help
     echo ""
     echo "  -c <cookie>       Set the cookie value (if not auto-detected)"
     echo "  -n <namespace>    Kubernetes namespace (if not auto-detected)"
+    echo "  -m                Manual mode (don't auto-connect remsh and observer)"
     echo ""
     echo "Example:"
     echo "  kubernato_observer your-service"
     echo "  kubernato_observer -c thecookievalue your-service"
+    echo "  kubernato_observer -m your-service    # Manual connection mode"
     echo ""
     exit
 }
@@ -25,8 +27,9 @@ fi
 
 OPTIND=1
 namespace=""
+manual_mode=false
 
-while getopts "?c:n:" opt; do
+while getopts "?c:n:m" opt; do
     case "$opt" in
     \?)
         show_help
@@ -35,6 +38,8 @@ while getopts "?c:n:" opt; do
     c)  COOKIE=$OPTARG
         ;;
     n)  namespace=$OPTARG
+        ;;
+    m)  manual_mode=true
         ;;
     esac
 done
@@ -55,10 +60,32 @@ function get_pod_info() {
     else
         ns_flag="-A"
     fi
-    kubectl get pod $ns_flag \
+    # Try with strict labels
+    local pod_info=$(kubectl get pod $ns_flag \
         -l=app.kubernetes.io/name=$app,app.kubernetes.io/component!=database \
         --field-selector=status.phase==Running \
-        -o jsonpath="{.items[0]['metadata.name', 'metadata.namespace']}" 2>/dev/null
+        -o jsonpath="{.items[0]['metadata.name', 'metadata.namespace']}" 2>/dev/null)
+    
+    # If nothing found, try with just the app name in various common label formats
+    if [[ -z "$pod_info" ]]; then
+        pod_info=$(kubectl get pod $ns_flag \
+            -l "app=$app" \
+            --field-selector=status.phase==Running \
+            -o jsonpath="{.items[0]['metadata.name', 'metadata.namespace']}" 2>/dev/null)
+    fi
+    
+    # If still nothing found, try with name in the pod name
+    if [[ -z "$pod_info" ]]; then
+        pod_info=$(kubectl get pod $ns_flag \
+            --field-selector=status.phase==Running \
+            -o jsonpath="{.items[*]['metadata.name', 'metadata.namespace']}" 2>/dev/null | \
+            tr ' ' '\n' | \
+            grep -A1 "$app" | \
+            tr '\n' ' ' | \
+            head -n1)
+    fi
+    
+    echo "$pod_info"
 }
 
 pod_info=$(get_pod_info "$app_name" "$namespace")
@@ -181,15 +208,30 @@ port_forward_pid=$!
 
 sleep 2  # Give port-forward time to establish
 
-echo "Starting iex shell..."
-echo "Once connected, run:"
-echo "1. Node.connect(:'$node_name')"
-echo "2. :observer.start()"
-echo ""
-
-# Start IEx with distribution configuration
-iex --name "$local_name@$remote_host" \
-    --cookie "$COOKIE" \
-    --hidden
+if [ "$manual_mode" = true ]; then
+    echo "Manual connection mode. To connect:"
+    echo ""
+    echo "1. Start an iex shell:"
+    echo "   iex --name \"$local_name@$remote_host\" --cookie \"$COOKIE\" --hidden"
+    echo ""
+    echo "2. Connect to the remote node:"
+    echo "   Node.connect(:'$node_name')"
+    echo ""
+    echo "3. Start the observer:"
+    echo "   :observer.start()"
+    echo ""
+    echo "Press Ctrl+C to clean up port forwarding when done."
+    
+    # Keep the script running to maintain port forwarding
+    while true; do sleep 1; done
+else
+    echo "Connecting to remote node and starting observer..."
+    
+    iex --name "$local_name@$remote_host" \
+        --cookie "$COOKIE" \
+        --hidden \
+        --remsh "$node_name" \
+        --eval ":observer.start()"
+fi
 
 cleanup "Done"
